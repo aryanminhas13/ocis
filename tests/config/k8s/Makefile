@@ -27,7 +27,7 @@ prepare-charts:
 	bash setup.sh $(CHART_REPO)
 	kubectl create namespace $(DOMAIN) || true
 	kubectl create configmap -n $(DOMAIN) ocis-fonts-ttf --from-file=../ci/NotoSans.ttf || true
-	sed 's|https://ocis-server:|https://$(DOMAIN):|g' ../ci/ocis-config.json > $(CHART_REPO)/web-config.json
+	sed 's|https://ocis-server:9200|https://$(DOMAIN)|g' ../ci/ocis-config.json > $(CHART_REPO)/web-config.json
 	kubectl create configmap -n $(DOMAIN) ocis-web-config \
 		--from-file=web-config.json=$(CHART_REPO)/web-config.json || true
 	kubectl create configmap -n $(DOMAIN) ocis-translations \
