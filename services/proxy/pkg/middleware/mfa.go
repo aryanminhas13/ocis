@@ -2,9 +2,11 @@ package middleware
 
 import (
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/jellydator/ttlcache/v3"
 	"github.com/owncloud/reva/v2/pkg/autoprop"
 	revactx "github.com/owncloud/reva/v2/pkg/ctx"
 	microstore "go-micro.dev/v4/store"
@@ -15,6 +17,9 @@ import (
 )
 
 const defaultMFASessionDuration = 3600
+
+// mfaStoreWriteInterval limits how often the MFA status of a user is written to the store.
+const mfaStoreWriteInterval = time.Minute
 
 // MultiFactor returns a middleware that checks requests for mfa
 func MultiFactor(cfg config.MFAConfig, opts ...Option) func(next http.Handler) http.Handler {
@@ -45,8 +50,8 @@ type MultiFactorAuthentication struct {
 	enabled         bool
 	authLevelNames  []string
 	sessionDuration time.Duration
-	// store persists verified MFA status so that non-OIDC requests (e.g.
-	// signed-URL archiver downloads) can inherit it from the user's most
+	// store holds the MFA status persisted by PersistMultiFactor, so that non-OIDC
+	// requests (e.g. signed-URL downloads) can inherit it from the user's most
 	// recent OIDC session. Nil when no store is configured.
 	store microstore.Store
 }
@@ -104,16 +109,9 @@ func (m MultiFactorAuthentication) ServeHTTP(w http.ResponseWriter, req *http.Re
 		m.logger.Debug().Str("acr", value).Str("url", req.URL.Path).Msg("accessing path without mfa")
 	} else {
 		m.logger.Debug().Str("acr", value).Str("url", req.URL.Path).Msg("mfa authenticated")
+		// The verified status is persisted by PersistMultiFactor, the user of an
+		// OIDC request is only known after the AccountResolver ran.
 		ctx = revactx.SetMFA(ctx)
-		// Persist the verified MFA status so that subsequent non-OIDC requests
-		// (e.g. signed-URL archiver downloads) can inherit it. The entry is
-		// refreshed on every successful OIDC MFA verification and expires after
-		// the configured session duration if no further OIDC requests are made.
-		if m.store != nil {
-			if u, ok := revactx.ContextGetUser(ctx); ok && u.GetId().GetOpaqueId() != "" {
-				m.writeMFAToStore(u.GetId().GetOpaqueId())
-			}
-		}
 	}
 
 	// MFA status will only be true if the acr claim contains the proper value,
@@ -121,21 +119,56 @@ func (m MultiFactorAuthentication) ServeHTTP(w http.ResponseWriter, req *http.Re
 	m.next.ServeHTTP(w, req.WithContext(ctx))
 }
 
+// readMFAFromStore checks if the user had MFA in an OIDC request within the session duration.
+// The age is checked here because stores like nats-js-kv don't support a per-record expiry.
 func (m MultiFactorAuthentication) readMFAFromStore(userID string) bool {
 	records, err := m.store.Read(key(userID))
 	if err != nil || len(records) == 0 {
 		return false
 	}
-	return string(records[0].Value) == "true"
+	verifiedAt, err := strconv.ParseInt(string(records[0].Value), 10, 64)
+	if err != nil {
+		return false
+	}
+	return time.Since(time.Unix(verifiedAt, 0)) < m.sessionDuration
 }
 
-func (m MultiFactorAuthentication) writeMFAToStore(userID string) {
-	if err := m.store.Write(&microstore.Record{
-		Key:    key(userID),
-		Value:  []byte("true"),
-		Expiry: m.sessionDuration,
-	}); err != nil {
-		m.logger.Error().Err(err).Str("userID", userID).Msg("failed to write MFA status to store")
+// PersistMultiFactor returns a middleware that stores when an OIDC request of a user last
+// had MFA, so that non-OIDC requests (e.g. signed-URL downloads) can inherit it, see
+// readMFAFromStore. The time is written at most once per mfaStoreWriteInterval and user.
+//
+// It must run after the AccountResolver, which adds the user of OIDC requests to the context.
+func PersistMultiFactor(cfg config.MFAConfig, opts ...Option) func(next http.Handler) http.Handler {
+	options := newOptions(opts...)
+
+	lastWriteCache := ttlcache.New(
+		ttlcache.WithTTL[string, struct{}](mfaStoreWriteInterval),
+		ttlcache.WithDisableTouchOnHit[string, struct{}](),
+	)
+	go lastWriteCache.Start()
+
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			ctx := req.Context()
+			// claims are required, a signed-URL request must not extend its own MFA status
+			if cfg.Enabled && options.MFAStore != nil && oidc.FromContext(ctx) != nil && revactx.HasMFA(ctx) {
+				if u, ok := revactx.ContextGetUser(ctx); ok && u.GetId().GetOpaqueId() != "" {
+					userID := u.GetId().GetOpaqueId()
+					if !lastWriteCache.Has(userID) {
+						if err := options.MFAStore.Write(&microstore.Record{
+							Key:   key(userID),
+							Value: []byte(strconv.FormatInt(time.Now().Unix(), 10)),
+						}); err != nil {
+							options.Logger.Error().Err(err).Str("userID", userID).Msg("failed to write MFA status to store")
+						} else {
+							lastWriteCache.Set(userID, struct{}{}, ttlcache.DefaultTTL)
+						}
+					}
+				}
+			}
+
+			next.ServeHTTP(w, req)
+		})
 	}
 }
 
